@@ -1,0 +1,852 @@
+esphome:
+  name: station-meteo
+  friendly_name: Station Météo
+
+  on_boot:
+    - priority: 800
+      then:
+        - delay: 1s
+        - switch.turn_on: I2C_POWER
+        - lambda: |-
+            // Initialize ring buffers
+            id(anemometer_count) = 0;
+            id(anemometer_head) = 0;
+            id(wind_dir_count) = 0;
+            id(wind_dir_head) = 0;
+            id(rainfall_count) = 0;
+            id(rainfall_head) = 0;
+            id(wind_publish_time) = millis();
+
+  platformio_options:
+    board_build.variant: um_feathers2
+    board_build.f_cpu: 80000000L
+
+esp32:
+  board: featheresp32-s2
+  variant: esp32s2
+  framework:
+    type: arduino
+
+logger:
+  level: error
+  logs:
+    i2c: error
+    deep_sleep: ERROR
+    mqtt: ERROR
+    mqtt.component: ERROR
+    mqtt.client: error
+
+mqtt:
+  id: mqtt_client
+  broker: 192.168.0.186
+  port: 1883
+  username: !secret mqtt_username
+  password: !secret mqtt_password
+  discovery: false
+  reboot_timeout: 6min
+  on_message:
+    - topic: station-meteo/all_go
+      then:
+        - lambda: |-
+            bool payload_value = strcmp(x.c_str(), "true") == 0;
+            id(all_go) = payload_value;
+    - topic: station-meteo/reset
+      then:
+        - lambda: |-
+            ESP_LOGE("ERROR", "!!!!!!!!!!!!!!!RESET BUTTON PRESSED, RESETTING DEVICE NOW!!!!!!!!!!!!!!!!!!!");
+            id(reset).press();
+
+ota:
+  - platform: esphome
+    password: "4b7458cae8533c49d5ab44fe4f229577"
+
+wifi:
+  id: main_wifi
+  power_save_mode: NONE
+  manual_ip:
+    static_ip: 192.168.0.139
+    gateway: 192.168.0.191
+    subnet: 255.255.255.0
+  fast_connect: True
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  reboot_timeout: 6min
+
+time:
+  - platform: sntp
+    id: homeassistant_time
+    servers:
+      - 0.pool.ntp.org
+      - 1.pool.ntp.org
+      - 2.pool.ntp.org
+
+i2c:
+  - id: bus_a
+    sda: GPIO3
+    scl: GPIO4
+    scan: true
+    frequency: 100khz
+    setup_priority: 600
+
+debug:
+  update_interval: 5min
+
+#bme68x_bsec2_i2c:
+#  address: 0x76
+#  model: bme680
+#  operating_age: 28d
+#  sample_rate: LP
+#  supply_voltage: 3.3V
+
+##########################################################################################################################################################
+#                                                                  GLOBALS                                                                               #
+##########################################################################################################################################################
+globals:
+  - id: in_deep_sleep_mode
+    type: bool
+    initial_value: 'false'
+
+  # Ring buffers
+  - id: anemometer_head
+    type: int
+    initial_value: '0'
+  - id: anemometer_count
+    type: int
+    initial_value: '0'
+  - id: anemometer_buffer
+    type: float[300]
+
+  - id: wind_publish_time
+    type: uint32_t
+    initial_value: '0'
+
+  - id: wind_dir_head
+    type: int
+    initial_value: '0'
+  - id: wind_dir_count
+    type: int
+    initial_value: '0'
+  - id: wind_direction_buffer
+    type: int[300]
+
+  - id: rainfall_head
+    type: int
+    initial_value: '0'
+  - id: rainfall_count
+    type: int
+    initial_value: '0'
+  - id: rainfall_buffer
+    type: int[300]
+
+  - id: Main_A_Minimal
+    type: float
+    initial_value: '0.0'
+
+  - id: last_MainA_update
+    type: uint32_t
+    initial_value: '0'
+
+  - id: first_150
+    type: bool
+    initial_value: 'true'
+
+  - id: Batt_A_Minimal
+    type: float
+    initial_value: '0.0'
+
+  - id: all_go
+    type: bool
+    initial_value: 'true'
+
+  - id: last_reset_time
+    type: time_t
+    restore_value: yes
+    initial_value: '0'
+
+  - id: i2c_check_needed
+    type: bool
+    initial_value: 'true'
+
+##########################################################################################################################################################
+#                                                                   SWITCH                                                                               #
+##########################################################################################################################################################
+switch:
+  - platform: gpio
+    id: I2C_POWER
+    restore_mode: ALWAYS_ON
+    pin: 7
+
+##########################################################################################################################################################
+#                                                                   BUTTON                                                                               #
+##########################################################################################################################################################
+button:
+
+  # Reset button
+  - platform: restart
+    name: "Réinitialisation"
+    id: reset
+
+  # MQTT Bomb to be sent once every 5 minutes to ease power drain
+  - platform: template
+    name: "Send All Sensor Data"
+    id: send_all_data
+    on_press:
+      then:
+        - mqtt.publish_json:
+            topic: "station-meteo/sensor/MQTT_Bomb"
+            qos: 2
+            retain: true
+            payload: |-
+              root["Temperature"] = id(bme280_temperature).state;
+              root["Humidity"] = id(bme280_humidity).state;
+              root["Pressure"] = id(bme280_pressure).state;
+              root["SEN55_Temp"] = id(SEN55_Temp).state;
+              root["SEN55_Humidity"] = id(SEN55_Humidity).state;
+              root["PM1"] = id(sen55_pm1).state;
+              root["PM2_5"] = id(sen55_pm2_5).state;
+              root["PM4"] = id(sen55_pm4).state;
+              root["PM10"] = id(sen55_pm10).state;
+              root["SEN55_voc"] = id(sen55_voc).state;
+              root["SEN55_nox"] = id(sen55_nox).state;
+              root["ENS180_tvoc"] = id(tvoc).state;
+              root["ENS180_eco2"] = id(eco2).state;
+              root["ENS180_AQI"] = id(ens160_air_quality_index).state;
+              root["uv_count"] = id(uv_count).state;
+              root["light_count"] = id(ambient_light).state;
+              root["Sol_A"] = id(Sol_A).state;
+              root["Sol_V"] = id(Sol_V).state;
+              root["Main_A_Actual"] = id(Main_A).state;
+              root["Main_A_Minimal"] = id(Main_A_Minimal);
+              root["Main_V"] = id(Main_V).state;
+              root["Batt_A_Actual"] = id(battery_current_sensor).state;
+              root["Batt_A_Minimal"] = id(Batt_A_Minimal);
+              root["Batt_V"] = id(battery_bus_voltage_sensor).state;
+
+              // Directions mapping
+              static const char* directions[] = {
+                "NORD", "NORD-EST", "EST", "SUD-EST", "SUD", "SUD-OUEST", "OUEST", "NORD-OUEST", "Inconnu"
+              };
+
+              // Wind Direction Buffer
+              {
+                JsonArray vane_array = root.createNestedArray("Vane_Buffer");
+                int count = id(wind_dir_count);
+                int start = id(wind_dir_head);
+                for (int i = 0; i < count; i++) {
+                  int idx = (start + i) % 300;
+                  vane_array.add(directions[id(wind_direction_buffer)[idx]]);
+                }
+              }
+
+              // Rain Buffer
+              {
+                JsonArray rain_array = root.createNestedArray("Rain_Buffer");
+                int count = id(rainfall_count);
+                int start = id(rainfall_head);
+                for (int i = 0; i < count; i++) {
+                  int idx = (start + i) % 300;
+                  rain_array.add(id(rainfall_buffer)[idx]);
+                }
+              }
+
+              // Wind Buffer
+              {
+                JsonArray wind_array = root.createNestedArray("Wind_Buffer");
+                int count = id(anemometer_count);
+                int start = id(anemometer_head);
+                for (int i = 0; i < count; i++) {
+                  int idx = (start + i) % 300;
+                  wind_array.add(id(anemometer_buffer)[idx]);
+                }
+              }
+
+              // DEBUG INFO
+              root["FreeHeap"] = id(heap_free).state;
+              root["HeapMax"] = id(heap_max).state;
+              root["Looptime"] = id(loop_time).state;
+              root["Device_Info"] = id(device_info).state;
+              root["Reset_Reason"] = id(reset_reason).state;
+        - lambda: |-
+            // After publishing, check if a day has passed and reset if so
+            auto now = id(homeassistant_time).now();
+            if (!now.is_valid()) {
+              ESP_LOGW("main", "Time not valid yet, skipping reset check.");
+              return;
+            }
+
+            time_t current_time = now.timestamp;
+            time_t one_day_seconds = 24 * 60 * 60;
+            if ((current_time - id(last_reset_time)) >= one_day_seconds) {
+              ESP_LOGI("main", "One day has passed. Resetting counter and pushing reset button.");
+              id(last_reset_time) = current_time;
+              id(reset).press();
+            }
+
+#              root["BME280_Temperature"] = id(bme280_temperature).state;
+#              root["BME280_Humidity"] = id(bme280_humidity).state;
+#              root["BME280_Pressure"] = id(bme280_pressure).state;
+#              root["Temperature"] = id(BME68x_temperature).state;
+#              root["Humidity"] = id(BME68x_humidity).state;
+#              root["Pressure"] = id(BME68x_pressure).state;
+#              root["BME688_eCO2"] = id(BME68x_eCO2).state;
+#              root["BME688_bVOC"] = id(BME68x_eBVOC).state;
+#              root["BME688_IAQ"] = id(iaq).state;
+
+##########################################################################################################################################################
+#                                                                  SENSORS                                                                               #
+##########################################################################################################################################################
+sensor:
+
+#####################################
+#              BME280               #
+#####################################  # Initializes the Adafruit's ESP32-S2 integrated BME280 (Temperature, Humidity and Pressure)
+  - platform: bme280_i2c
+    temperature:
+      name: "BME280 - Température"
+      id: bme280_temperature
+      oversampling: 4x
+      internal: true
+      filters:
+        offset: -6.9
+    pressure:
+      name: "BME280 - Pression Atmosphérique"
+      id: bme280_pressure
+      oversampling: 4x
+      internal: true
+      filters:
+        - multiply: 0.9992
+    humidity:
+      name: "BME280 - Humidité"
+      id: bme280_humidity
+      oversampling: 4x
+      internal: true
+    address: 0x77
+    iir_filter: 4x
+    update_interval: 300s
+
+#####################################
+#              BME688               #
+#####################################  # Initializes the BME688 (Temperature, Humidity, Pressure, Equivalent CO2 and Breath VOC)
+#  - platform: bme68x_bsec2
+#    temperature:
+#      name: "Température"
+#      id: "BME68x_temperature"
+#      filters:
+#    pressure:
+#      name: "Pression Atmosphérique"
+#      id: "BME68x_pressure"
+#    humidity:
+#      name: "Humidité"
+#      id: "BME68x_humidity"
+#      filters:
+#    iaq:
+#      name: "Air - Indice de la Qualité de l'Air"
+#      id: iaq
+#    co2_equivalent:
+#      name: "Air - Équivalent CO²"
+#      id: "BME68x_eCO2"
+#    breath_voc_equivalent:
+#      name: "Air - Équivalent bVOC"
+#      id: "BME68x_eBVOC"
+
+#####################################
+#             ZMOD4510              #
+#####################################  #
+
+
+#####################################
+#              SEN55                #
+#####################################  # Initializes the SEN55 (Particulate Matter and NOx)
+  - platform: sen5x
+    address: 0x69
+    temperature:
+      name: "X - SEN55 - Temp"
+      id: SEN55_Temp
+      internal: true
+      filters:
+        offset: -3
+    humidity:
+      name: "X - SEN55 - Humidité"
+      id: SEN55_Humidity
+      internal: true
+      filters:
+        offset: -2.5
+    pm_1_0:
+      name: "Air - PM1.0 et -"
+      id: sen55_pm1
+      internal: true
+    pm_2_5:
+      name: "Air - PM2.5 et -"
+      id: sen55_pm2_5
+      internal: true
+    pm_4_0:
+      name: "Air - PM4.0 et -"
+      id: sen55_pm4
+      internal: true
+    pm_10_0:
+      name: "Air - PM10.0 et -"
+      id: sen55_pm10
+      internal: true
+    voc:
+      name: "Air - Index VOC"
+      id: sen55_voc
+      internal: true
+      filters:
+        - throttle: 300s
+    nox:
+      name: "Air - NOx"
+      id: sen55_nox
+      internal: true
+      filters:
+        - throttle: 300s
+    update_interval: 300s
+    store_baseline: True
+    acceleration_mode: medium
+
+#####################################
+#              ENS160               #
+#####################################  # Initializes the ENS160 (Total VOC and Equivalent CO2)
+  - platform: ens160_i2c
+    tvoc:
+      name: "Air - Concentration COV"
+      id: tvoc
+      internal: true
+      filters:
+        - throttle: 300s
+    eco2:
+      name: "Air - Équivalent CO²"
+      id: eco2
+      internal: true
+      filters:
+        - throttle: 300s
+    aqi:
+      id: ens160_air_quality_index
+      name: "X - Air - AQI"
+      internal: true
+    update_interval: 300s
+    address: 0x52
+    compensation:
+      temperature: bme280_temperature
+      humidity: bme280_humidity
+
+#####################################
+#              LTR390               #
+#####################################  # Initializes the LTR390 (ALS and UV sensor)
+  - platform: ltr390
+    uv:
+      name: "Lumière - Compte UVs"
+      id: uv_count
+      internal: true
+    gain:
+      ambient_light: X1
+      uv: X18
+    resolution:
+      ambient_light: 18
+      uv: 20
+    light:
+      name: "Lumière - Luminosité"
+      id: ambient_light
+      internal: true
+    update_interval: 300s
+
+#####################################
+#             WIND GAUGE            #
+#####################################  # Initializes the wind gauge and places the values in the ring buffer
+  - platform: pulse_counter
+    pin: GPIO11
+    name: "X - Anémomètre - Fréquence"
+    id: anemometer_frequency
+    unit_of_measurement: "Hz"
+    internal: true
+    filters:
+      - multiply: 0.0166667
+    update_interval: 1s
+
+  - platform: template
+    name: "Anemometer Data Collector"
+    id: anemometer_data_collector
+    update_interval: 1s
+    internal: true
+    lambda: |-
+      float val = id(anemometer_frequency).state;
+      if (id(anemometer_count) < 300) {
+        int idx = (id(anemometer_head) + id(anemometer_count)) % 300;
+        id(anemometer_buffer)[idx] = val;
+        id(anemometer_count)++;
+      } else {
+        id(anemometer_buffer)[id(anemometer_head)] = val;
+        id(anemometer_head) = (id(anemometer_head) + 1) % 300;
+      }
+      return 0.0;
+
+#####################################
+#           RAIN COUNTER            #
+#####################################  # Initializes the rainfall counter
+  - platform: pulse_counter
+    pin: GPIO12
+    name: "X - Pluie - Compteur"
+    id: pluie_compteur
+    unit_of_measurement: "bascules"
+    accuracy_decimals: 0
+    internal: true
+    update_interval: 1s
+
+#####################################
+#              INA219               #
+#####################################  # Initializes the INA219 (Power Monitor)
+  
+  # Solar Panel
+  - platform: ina219
+    address: 0x40
+    shunt_resistance: 0.1 ohm
+    current:
+      name: "Électricité - Sol A"
+      id: Sol_A
+      internal: true
+    bus_voltage:
+      name: "Électricité - Sol V"
+      id: Sol_V
+      internal: true
+    max_voltage: 24.0V
+    max_current: 1A
+    update_interval: 300s
+
+  # ESP32-S2
+  - platform: ina219
+    address: 0x41
+    shunt_resistance: 0.1 ohm
+    current:
+      name: "Électricité - Main A"
+      id: Main_A
+      internal: true
+    bus_voltage:
+      name: "Électricité - Main V"
+      id: Main_V
+      internal: true
+    max_voltage: 5.5V
+    max_current: 0.5A
+    update_interval: 150s
+
+  # Battery
+  - platform: ina219
+    address: 0x44
+    shunt_resistance: 0.1 ohm
+    current:
+      name: "Électricité - Batt A"
+      id: battery_current_sensor
+      internal: true
+    bus_voltage:
+      name: "Électricité - Batt V"
+      id: battery_bus_voltage_sensor
+      internal: true
+    max_voltage: 5V
+    max_current: 0.6A
+    update_interval: 150s
+
+#####################################
+#               DEBUG               #
+#####################################  # Because we like debugging
+  - platform: debug
+    free:
+      name: "Heap Free"
+      id: heap_free
+    block:
+      name: "Heap Max Block"
+      id: heap_max
+    loop_time:
+      name: "Loop Time"
+      id: loop_time
+
+##########################################################################################################################################################
+#                                                                 BINARY SENSORS                                                                         #
+##########################################################################################################################################################
+binary_sensor:
+
+#####################################
+#             WIND VANE             #
+#####################################  # Identifies the current wind vane direction state to its appropriate id
+  - platform: gpio
+    pin:
+      number: GPIO5
+      mode: INPUT_PULLUP
+    id: north
+    internal: true
+  - platform: gpio
+    pin:
+      number: GPIO6
+      mode: INPUT_PULLUP
+    id: east
+    internal: true
+  - platform: gpio
+    pin:
+      number: GPIO9
+      mode: INPUT_PULLUP
+    id: south
+    internal: true
+  - platform: gpio
+    pin:
+      number: GPIO10
+      mode: INPUT_PULLUP
+    id: west
+    internal: true
+  - platform: gpio
+    pin:
+      number: GPIO13
+      mode: INPUT_PULLUP
+    id: northeast
+    internal: true
+  - platform: gpio
+    pin:
+      number: GPIO36
+      mode: INPUT_PULLUP
+    id: northwest
+    internal: true
+  - platform: gpio
+    pin:
+      number: GPIO35
+      mode: INPUT_PULLUP
+    id: southeast
+    internal: true
+  - platform: gpio
+    pin:
+      number: GPIO37
+      mode: INPUT_PULLUP
+    id: southwest
+    internal: true
+
+#####################################
+#           WIFI STATUS             #
+#####################################
+  - platform: status
+    id: wifi_status
+    internal: True
+
+##########################################################################################################################################################
+#                                                                 TEXT SENSORS                                                                           #
+##########################################################################################################################################################
+text_sensor:
+
+#####################################
+#             WIND VANE             #
+#####################################  # Makes every wind vane direction correlate to its appropriate string
+  - platform: template
+    name: "X - Air - Direction du Vent Instantanée"
+    id: air_direction_du_vent
+    internal: true
+    update_interval: 1s
+    lambda: |-
+      static int last_dir_idx = 8; // Inconnu
+      int new_dir_idx = 8;
+      if (!id(north).state)          new_dir_idx = 0;
+      else if (!id(northeast).state) new_dir_idx = 1;
+      else if (!id(east).state)      new_dir_idx = 2;
+      else if (!id(southeast).state) new_dir_idx = 3;
+      else if (!id(south).state)     new_dir_idx = 4;
+      else if (!id(southwest).state) new_dir_idx = 5;
+      else if (!id(west).state)      new_dir_idx = 6;
+      else if (!id(northwest).state) new_dir_idx = 7;
+      else {
+        if (last_dir_idx == 8) {
+          new_dir_idx = 8; // Inconnu
+        } else {
+          new_dir_idx = last_dir_idx;
+        }
+      }
+
+      if (new_dir_idx != last_dir_idx) {
+        last_dir_idx = new_dir_idx;
+        const char* directions[] = {"NORD", "NORD-EST", "EST", "SUD-EST", "SUD", "SUD-OUEST", "OUEST", "NORD-OUEST", "Inconnu"};
+        return std::string(directions[new_dir_idx]);
+      } else {
+        return {};
+      }
+
+#####################################
+#               DEBUG               #
+#####################################  # Publishes the device info and the last reset reason, because we like debugging
+  - platform: debug
+    device:
+      name: "Device Info"
+      id: device_info
+    reset_reason:
+      name: "Reset Reason"
+      id: reset_reason
+
+##########################################################################################################################################################
+#                                                                 INTERVAL                                                                               #
+##########################################################################################################################################################
+interval:
+
+#####################################
+#             RAIN GAUGE            #
+#####################################  # Publishes the rain gauge's value to its ring buffer
+#  - interval: 1s
+#    then:
+#      - lambda: |-
+#          int rainfall_val = (int)id(pluie_compteur).state;
+#          if (id(rainfall_count) < 300) {
+#            int idx = (id(rainfall_head) + id(rainfall_count)) % 300;
+#            id(rainfall_buffer)[idx] = rainfall_val;
+#            id(rainfall_count)++;
+#          } else {
+#            id(rainfall_buffer)[id(rainfall_head)] = rainfall_val;
+#            id(rainfall_head) = (id(rainfall_head) + 1) % 300;
+#          }
+
+#####################################
+#             WIND VANE             #
+#####################################  # Publishes the wind vane adequate string to its ring buffer
+  - interval: 1s
+    then:
+      - lambda: |-
+          const char* directions[] = {"NORD","NORD-EST","EST","SUD-EST","SUD","SUD-OUEST","OUEST","NORD-OUEST","Inconnu"};
+          std::string current_direction = id(air_direction_du_vent).state.c_str();
+          int dir_idx = 8; 
+          for (int i=0; i<9; i++){
+            if (current_direction == directions[i]) {
+              dir_idx = i;
+              break;
+            }
+          }
+
+          if (id(wind_dir_count) < 300) {
+            int idx = (id(wind_dir_head) + id(wind_dir_count)) % 300;
+            id(wind_direction_buffer)[idx] = dir_idx;
+            id(wind_dir_count)++;
+          } else {
+            id(wind_direction_buffer)[id(wind_dir_head)] = dir_idx;
+            id(wind_dir_head) = (id(wind_dir_head) + 1) % 300;
+          }
+
+#####################################
+#          MILLIS UPDATE            #
+#####################################  # Update millis readings every 150s
+  
+  # To know the ESP32-S2's power draw when in light sleep mode
+  - interval: 150s
+    then:
+      - lambda: |-
+          uint32_t now = millis();
+          if (id(first_150) && now >= 140000) {
+            id(Main_A_Minimal) = id(Main_A).state;
+            id(last_MainA_update) = now;
+            id(first_150) = false;
+          }
+
+          if(!id(first_150) && now - id(last_MainA_update) >= 300000) {
+            id(Main_A_Minimal) = id(Main_A).state;
+            id(last_MainA_update) = now;
+          }
+
+  # To know the battery's drain when the ESP32-S2 is in light sleep mode
+  - interval: 150s
+    then:
+      - lambda: |-
+          uint32_t now = millis();
+          if (id(first_150) && now >= 140000) {
+            id(Batt_A_Minimal) = id(battery_current_sensor).state;
+            id(last_MainA_update) = now;
+            id(first_150) = false;
+          }
+          if(!id(first_150) && now - id(last_MainA_update) >= 300000) {
+            id(Batt_A_Minimal) = id(battery_current_sensor).state;
+            id(last_MainA_update) = now;
+          }
+
+#####################################
+#           5 MIN PUBLISH           #
+#####################################  # Publish the MQTT data bomb every 5 minutes if conditions are met
+  - interval: 5min
+    then:
+      - if:
+          condition:
+            lambda: |-
+              return id(main_wifi).is_connected() && id(mqtt_client)->is_connected() && id(all_go);
+          then:
+            - button.press: send_all_data
+          else:
+            - lambda: |-
+                ESP_LOGW("main", "Skipping MQTT publish because Wi-Fi or MQTT is not connected or all_go is false.");
+
+#####################################
+#          ALL GO SENSOR            #
+#####################################  # Publishes acknowledgement of ALL_GO being off
+  - interval: 1s
+    then:
+      - lambda: |-
+          if(!id(all_go)) {
+            ESP_LOGE("error", "!!!!!!!WARNING WARNING!!!!!!! SYSTEM IS HALTED BY ALL_GO !!!!!!!WARNING WARNING!!!!!!!");
+          }
+
+#####################################
+#           I2C CHECKER             #
+#####################################  # Checks that all I2C devices are initialized, else reset the I2C bus
+#  - interval: 10s
+#    then:
+#      - lambda: |-
+#          if (!id(i2c_check_needed)) {
+#            return;
+#          }
+#
+#          // Expected I2C addresses (0x0B , 0x53 LTR390, 0x77 BME280, 0x69 SEN55, 0x52 ENS160, 0x40 INA219, 0x41 INA219, 0x44 INA219)
+#          const uint8_t expected_addresses[] = {0x0B, 0x53, 0x77, 0x69, 0x52, 0x40, 0x41, 0x44};
+#          bool all_found = true;
+#
+#          for (uint8_t addr : expected_addresses) {
+#            bool found = false;
+#            if (id(bus_a).write(addr, nullptr, 0) == i2c::ERROR_OK) {
+#              found = true;
+#            }
+#            
+#            if (!found) {
+#              all_found = false;
+#              ESP_LOGW("I2C", "Address 0x%02X not found on I2C bus!", addr);
+#            }
+#          }
+#
+#          if (all_found) {
+#            ESP_LOGI("I2C", "All I2C devices successfully detected.");
+#            id(i2c_check_needed) = false;  // Stop further checks
+#          } else {
+#            ESP_LOGE("I2C", "Some I2C devices are missing. Power-cycling I2C devices.");
+#            id(I2C_POWER).turn_off();  // Turn off I2C power
+#            delay(10000);               // Wait for devices to power down
+#            id(I2C_POWER).turn_on();  // Turn on I2C power
+#          }
+
+
+
+
+
+#          int rainfall_val = (int)id(pluie_compteur).state;
+#          if (rainfall_val > 2 && id(rainfall_count) > 0) {
+#            int recent_valid_values = 0;
+#            int valid_sum = 0;
+#            int look_back = (id(rainfall_count) < 3) ? id(rainfall_count) : 3;
+#
+#            for (int i=0; i<look_back; i++) {
+#              int idx = (id(rainfall_head) + id(rainfall_count) - 1 - i + 300) % 300;
+#              int val = id(rainfall_buffer)[idx];
+#              if (val > 0) {
+#                recent_valid_values++;
+#                valid_sum += val;
+#              }
+#            }
+#
+#            if (recent_valid_values > 0) {
+#              rainfall_val = valid_sum / recent_valid_values;
+#            } else {
+#              bool found_positive = false;
+#              int to_check = (id(rainfall_count) < 60) ? id(rainfall_count) : 60;
+#              for (int i = 0; i < to_check; i++) {
+#                int idx = (id(rainfall_head) + id(rainfall_count) - 1 - i + 300) % 300;
+#                if (id(rainfall_buffer)[idx] > 0) {
+#                  found_positive = true;
+#                  break;
+#                }
+#              }
+#              if (!found_positive) {
+#                rainfall_val = 0;
+#              }
+#            }
+#          }
